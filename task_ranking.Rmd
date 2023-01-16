@@ -1,0 +1,427 @@
+---
+title: "P-values, Null distributions, Omics ranking"
+author: "[John Zobolas](https://github.com/bblodfon)"
+output:
+  html_document:
+    css: style.css
+    theme: united
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: false
+    code_folding: hide
+    code_download: true
+date: "Last updated: `r format(Sys.time(), '%d %B, %Y')`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = '')
+library(dplyr)
+library(tibble)
+library(forcats)
+library(ggplot2)
+library(combinat)
+```
+
+# On p-values {-}
+
+## Coin Example {-}
+
+**Coin example**: is it fair or not?
+```{r}
+knitr::include_graphics(path = 'img/coin.jpeg')
+```
+
+Let's conduct an experiment => throw $100$ times and count #heads.
+Let's say we **observed an extreme $64$ heads**.
+Do we have enough evidence to say coin if unfair?
+
+:::{.info-box .note}
+4 things to remember when calculating p-values:
+
+1. Null hypothesis $H_0$: **fair coin** (#heads ~ $50$)
+2. Test statistic: #heads => distribution (mean $50$?)
+3. Compute p-value as:
+
+$Prob(Obs|H_0) = Prob(64 \text{ heads}|H_0:\text{coin is fair})$
+
+4. Decide on significance threshold ($0.05$)
+:::
+
+## Simulation {-}
+
+Let's do a **simulation**:
+
+- Throw $100$ times a fair coin ($H_0$) and count #heads
+- Repeat $10000$ times! => make distribution of #heads
+
+```{r, cache=TRUE}
+set.seed(42)
+repeats = 10000
+res = sapply(1:repeats, function(num) {
+  stat = sample(x = c('heads', 'tails'), replace = T, size = 100)
+  sum(stat == 'heads')
+})
+```
+
+Draw the distribution of #heads:
+```{r}
+main1 = '10000 x throw coin 100 times experiment! (coin is FAIR)'
+hist(res, main = main1, xlab = 'Number of heads')
+# plot(density(res), main = main1) # smoothed out
+```
+
+:::{.info-box .note}
+- The above simulation is formally called *Monte Carlo Random Sampling* [[wiki](https://en.wikipedia.org/wiki/Monte_Carlo_method)]
+- This is the **empirical null distribution** of our test statistic (#heads)!
+:::
+
+## Empirical p-value {-}
+
+Where does the observation ($64$ heads) 'sit' in this distribution?
+
+```{r}
+hist(res, xlim = c(20,80), main = 'Null distr', xlab = 'Number of heads')
+abline(v = 64, col = 'red')
+```
+
+The **empirical p-value** is the proportion of experiments that yielded **equal or more** than the observed #heads ($64$):
+```{r, class.source = 'fold-show'}
+p_val = sum(sort(res) >= 64)/length(res) # length(res) = 10000
+p_val
+```
+
+Since the above p-value is lower than a predefined threshold (e.g. $0.05$) I can deduce that **the coin is unfair**.
+More extreme observations would yield smaller p-values, e.g. for #heads = $80$:
+```{r}
+sum(sort(res) > 80)/length(res) # length(res) = 10000
+```
+
+## Exact p-value {-}
+
+:::{.green-box}
+For this simple example, we could use statistical theory to calculate **exact p-value** (fair coin toss follows *binomial distribution*):
+
+$$P(\text{#heads} \ge 64 | 100 \text{ tosses of a fair coin}) = \\
+1 - P(\text{#heads} \le 63)$$
+:::
+
+In `R` it's easy to calculate using the (cumulative) distribution function of the binomial `pbinom`:
+```{r, class.source = 'fold-show'}
+1 - pbinom(q = 63, size = 100, prob = 0.5)
+```
+
+For $80$ heads the p-value can be exactly found now:
+```{r, class.source = 'fold-show'}
+1 - pbinom(q = 79, size = 100, prob = 0.5)
+```
+
+# Omics Ranking {-}
+
+## Benchmark Description {-#bench}
+
+```{r}
+ranks = readRDS(file = 'ranks.rds')
+```
+
+We have conducted a benchmark as follows:
+
+:::{.blue-box}
+- We trained and tested several ML models on many datasets
+- The datasets are **dependent** (different omic combinations)
+  - All single omics: mRNA, miRNA, Clinical, etc.
+  - All pairs of omics: Clinical + mRNA, miRNA + mRNA
+  - All triplets and so on... (*powerset* = **every possible omic (feature type) combination**)
+- **Performance measure**: C-index (higher is better)
+  - We take the median C-index across $1000$ bootstrap resamples of the test set
+:::
+
+E.g. for the `CoxNet` model the performance across all omic combinations is:
+```{r}
+coxnet_scores = 
+  ranks$mat['coxnet',] %>% 
+  tibble::enframe(name = 'Task', value = 'Cindex') %>%
+  mutate(Task = forcats::fct_reorder(Task, Cindex, .desc = TRUE))
+
+coxnet_scores %>%
+  ggplot(aes(x = Task, y = Cindex)) +
+    geom_point() +
+    geom_hline(yintercept = 0.5, linetype = 'dotted', color = 'red') +
+    labs(x = 'Omic Combinations', y = 'Harrell\'s C-index', title = 'CoxNet') +
+    ylim(c(0.4,0.6)) +
+    geom_text(aes(label = rank(-Cindex)), hjust = 0.5, vjust = -1) +
+    theme_bw(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1))
+```
+
+## The task {-}
+
+:::{.green-box}
+Can I define a **statistic/score** per omic that will tell me *how important* that particular omic is (and *strength of importance* with the p-value)?
+:::
+
+How to define *importance* in the above context?
+
+## Rank-Sum score {-}
+
+### Deriving the score {-}
+
+Let's use some toy data with $3$ omics and all combos ($2^3 - 1 = 7$) - why not $8$?:
+```{r}
+set1 = LETTERS[1:3]
+set1
+```
+
+```{r}
+get_subsets = function(set) {
+  lapply(1:length(set), combinat::combn, x = set, simplify = FALSE) %>% 
+  unlist(recursive = FALSE) %>%
+  lapply(function(sub_set) {
+    paste0(sub_set, collapse = '-') 
+  }) %>% 
+  unlist(use.names = FALSE)
+}
+
+subsets = get_subsets(set1)
+subsets
+```
+
+:::{.info-box .note}
+How many times every omic appears in the above list? For $n$ omics?
+:::
+
+```{r}
+# Answer: $2^{(n-1)}$
+# In the example: n = 3 => 2^2 = 4 times
+```
+
+Example rankings - 3 x same figure, change color if omic combo has:
+
+- <span style="color: red;">A</span>
+- <span style="color: blue;">B</span>
+- <span style="color: purple;">C</span>
+
+```{r}
+set.seed(42)
+scores = rnorm(1:7, mean = 0.5, sd = 0.1)
+tbl = tibble(Task = subsets, meas = scores) %>%
+      mutate(Task = forcats::fct_reorder(Task, meas, .desc = TRUE))
+
+p = tbl %>%
+  ggplot(aes(x = Task, y = meas)) +
+    geom_point(size = 3) +
+    geom_hline(yintercept = 0.5, linetype = 'dotted', color = 'red') +
+    labs(x = 'Omic Combinations', y = 'Harrell\'s C-index', title = 'Toy Example') +
+    ylim(c(0.4,0.7)) +
+    geom_text(aes(label = rank(-meas)), size = 10, hjust = 0.5, vjust = -1) +
+    theme_bw(base_size = 20)
+```
+
+```{r, warning=FALSE, fig.show="hold", out.width="50%", cache=T}
+mycol1 = ifelse(grepl(pattern = 'A', x = levels(tbl$Task)), 'red', 'black')
+mycol2 = ifelse(grepl(pattern = 'B', x = levels(tbl$Task)), 'blue', 'black')
+mycol3 = ifelse(grepl(pattern = 'C', x = levels(tbl$Task)), 'purple', 'black')
+
+# A more important
+p + theme(axis.text.x = element_text(color = mycol1))
+# B next 
+p + theme(axis.text.x = element_text(color = mycol2))
+# C last
+p + theme(axis.text.x = element_text(color = mycol3))
+```
+
+:::{.info-box .tip}
+A more important omic will be in more combos **towards the left** of the above figures!
+:::
+
+Let's define based on the *more left*-idea!
+
+Define as score the **sum of ranks (the lower the better)**:
+
+- `A` => $1+2+3+4=10$ (best possible, $4$ most-left ranks)
+- `B` => $1+3+6+7=17$
+- `C` => $1+4+5+6=16$ (a little better than $8$)
+<br><br><br><br>
+
+Worst score would be?
+
+- $4$ most-right ranks => $4+5+6+7=22$
+<br><br><br><br>
+I can easily **normalize** the score so that best possible value becomes $1$ and worst possible $0$, as:
+
+$$score = 1 - \frac{sum(ranks) - best(score)}{worst(score) - best(score)}$$
+
+Therefore we have:
+
+- `A`: $score = 1 - \frac{10 - 10}{22 - 10}=1$
+- `B`: $score = 1 - \frac{17 - 10}{22 - 10}=0.41$
+- `C`: $score = 1 - \frac{16 - 10}{22 - 10}=0.5$
+<br><br><br><br>
+<br><br><br><br>
+
+### Get a p-value {-}
+
+:::{.info-box .orange-box}
+- **How high** needs this score to be to be actually important?
+- How to construct the **null distribution** of our derived score/statistic and get an empirical p-value?
+:::
+
+<br><br><br><br>
+
+Observation: every omic in the toy example will take $4$ values from the below rankings:
+```{r}
+nomics = 3
+ranks = 1:(2^nomics-1)
+ranks
+```
+
+We just need to randomly select $4$ of these and add them (+normalization step) to get a possible rank-sum score. 
+Of course we will repeat this procedure **multiple times**:
+```{r}
+nsets = 2^(nomics-1) # 4
+
+# smaller possible rank sum (all left ranks)
+best_rs  = sum(1:2^(nomics-1)) # 10
+# larger possible rank sum (all right ranks)
+worst_rs = sum(seq(to = 2^nomics-1, length.out = 2^(nomics-1))) # 22
+
+# generate null dist - same for each omic
+# use simple Monte Carlo random sampling
+set.seed(42)
+nsamples = 1000
+null_nrs = sapply(1:nsamples, function(s) {
+  rank_sum = sum(sample(x = ranks, size = nsets, replace = FALSE))
+  1 - (rank_sum - best_rs)/(worst_rs - best_rs)
+})
+```
+
+```{r}
+hist(null_nrs)
+```
+
+`A` omic is important at the $0.05$ significance level:
+```{r, class.source = 'fold-show'}
+scoreA = 1
+pval_A = (sum(null_nrs >= scoreA)+1)/(length(null_nrs)+1)
+pval_A
+```
+
+```{r, class.source = 'fold-show'}
+scoreB = 0.41
+pval_B = (sum(null_nrs >= scoreB)+1)/(length(null_nrs)+1)
+pval_B
+```
+
+```{r, class.source = 'fold-show'}
+scoreC = 0.5
+pval_C = (sum(null_nrs >= scoreC)+1)/(length(null_nrs)+1)
+pval_C
+```
+
+Another hypothetical example with a $score = 0.92$:
+```{r, class.source = 'fold-show'}
+score = 0.92
+pval = (sum(null_nrs >= score)+1)/(length(null_nrs)+1)
+pval
+```
+
+- Discuss importance of number of omics $n$ (the more the better!)
+
+**Unique scores** in the null distribution very few:
+```{r}
+unique(null_nrs)
+```
+
+### Relation to Wilcoxon Rank Sum Test {-}
+
+Let's focus on `A` omic and focus not on rankings but on the actual performance scores:
+```{r, warning=FALSE, fig.show="hold", out.width="50%", cache=T}
+tbl %>%
+  ggplot(aes(x = Task, y = meas)) +
+    geom_point(size = 3) +
+    geom_hline(yintercept = 0.5, linetype = 'dotted', color = 'red') +
+    labs(x = 'Omic Combinations', y = 'Harrell\'s C-index', title = 'Toy Example') +
+    ylim(c(0.4,0.7)) +
+    geom_text(aes(label = sprintf("%0.3f", round(meas, digits = 3))), size = 7, hjust = 0.5, vjust = -1) +
+    theme_bw(base_size = 20) +
+    theme(axis.text.x = element_text(color = mycol1))
+
+tbl = tbl %>% 
+  mutate(grp = case_when(
+    grepl(pattern = 'A', x = Task) ~ 'A', 
+    TRUE ~ 'not A')
+  )
+
+tbl %>%
+  ggplot(aes(x = grp, y = meas, fill = grp)) +
+    geom_boxplot() +
+    theme_bw(base_size = 20)
+```
+
+```{r, class.source = 'fold-show'}
+A    = tbl %>% filter(grp == 'A') %>% pull(meas)
+notA = tbl %>% filter(grp == 'not A') %>% pull(meas)
+
+# is performance scores from 'A' distribution less than 'notA'?
+wilcox.test(x = A, y = notA, alternative = 'greater')
+```
+
+:::{.info-box .note}
+Results are close - the calculation of `W` statistic is similar to our logic (sum of ranks)
+:::
+
+## Kolmogorov-Smirnov statistic {-}
+
+The idea for this statistic came from viewing this as a *gene enrichment* problem (see [References]).
+
+:::{.green-box}
+- **KS test**: check if 2 data samples come from the same probability distribution or not.
+It uses the eCDF (Empirical Cumulative Density Function) [[wikipedia](https://en.wikipedia.org/wiki/Kolmogorov-Smirnov_test)]
+:::
+
+Let's view an example using the research [results](#bench) and consider the `Clinical` as the omic of interest:
+```{r}
+coxnet_scores = coxnet_scores %>% 
+  mutate(grp = case_when(
+    grepl(pattern = 'Clinical', x = Task) ~ 'Clin', 
+    TRUE ~ 'not-Clin')
+  )
+
+clin     = coxnet_scores %>% filter(grp == 'Clin') %>% pull(Cindex)
+not_clin = coxnet_scores %>% filter(grp == 'not-Clin') %>% pull(Cindex)
+```
+
+Histograms/Density of the performance scores (C-indexes), comparing omic-combos that had **Clinical** features included vs those that did not:
+```{r, message=FALSE}
+ggplot(coxnet_scores, aes(y = Cindex, fill = grp)) +
+  geom_histogram(bins = 20) +
+  geom_density(alpha = 0.3) +
+  ylim(c(0.4, 0.6)) +
+  coord_flip() +
+  theme_bw(base_size = 14)
+```
+
+The empirical Cumulative Distribution Function for each group is:
+```{r}
+ggplot(coxnet_scores, aes(Cindex, colour = grp)) +
+  stat_ecdf() +
+  labs(y = 'Empirical CDF') +
+  theme_bw(base_size = 14)
+```
+
+```{r}
+ks.test(x = clin, y = not_clin, alternative = 'less')
+```
+
+:::{.info-box .note}
+- Compare our statistic vs KS statistic
+
+Usually it's better to not re-invent the wheel but sometimes we need to!
+:::
+
+# References {-}
+
+- Chapter 13 of 2nd edition of *An Introduction to Statistical Learning*, Springer
+- Subramanian, A., Tamayo, P., Mootha, V. K., Mukherjee, S., Ebert, B. L., Gillette, M. A., Paulovich, A., Pomeroy, S. L., Golub, T. R., Lander, E. S., & Mesirov, J. P. (2005). Gene set enrichment analysis: A knowledge-based approach for interpreting genome-wide expression profiles. Proceedings of the National Academy of Sciences, 102(43), 15545–15550. https://doi.org/10.1073/PNAS.0506580102
